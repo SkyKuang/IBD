@@ -15,14 +15,14 @@
 ### Installation
 The training environment (PyTorch and dependencies) can be installed as follows:
 ```
-cd SCARL-master
+cd IBD-master
 pip install -r requirements.txt
 ```
-### Train SCARL fron scratch on CIFAR-10
+### Train IBD
 ```
 sh ./train.sh
 ```
-### Evaluate SCARL
+### Evaluate IBD
 ```
 sh ./eval.sh
 ```
