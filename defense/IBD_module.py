@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-# from torch.autograd.gradcheck import zero_gradients
+from torch.autograd.gradcheck import zero_gradients
 from utils import label_smoothing, one_hot_tensor,softCrossEntropy
 import torchvision
 import math
@@ -19,6 +19,7 @@ from losses import pearson_loss, sinkhorn_loss_joint_IPOT
 import pdb
 import argparse
 import numpy as np
+import os
 
 def unique_shape(s_shapes):
     n_s = []
@@ -46,34 +47,57 @@ class Dist_Module(nn.Module):
         self.early_stop = False
         self.args = args
         self.num_classes = args.num_classes
-        
-        self.alpha = 0.9
-        self.temperature = 4
-        self.beta = 200
+
+        self.beta = 1
         self.qk_dim = 128
         self.guide_layers = np.arange(1, (34 - 4) // 2 + 1)
-        # self.guide_layers = np.arange(1, (18 - 4) // 2 + 1)
-        # self.hint_layers  = np.arange(1, (34 - 4) // 2 + 1)
-        self.hint_layers  = np.arange(1, (34 - 2) // 2 + 1)
+        # self.guide_layers  = np.arange(1, (18 - 2) // 2 + 1)
+        self.hint_layers  = np.arange(1, (18 - 2) // 2 + 1)
         with torch.no_grad():
             data = torch.randn(2, 3, 32, 32).cuda()
             _, feat_t = self.aux_net(data, is_feat=True)
             _, feat_s = self.basic_net(data, is_feat=True)
-        self.guide_layers = np.arange(0, 5)
-        self.hint_layers  = np.arange(0, 5)
         self.s_shapes = [feat_s[i].size() for i in self.hint_layers]
         self.t_shapes = [feat_t[i].size() for i in self.guide_layers]
         self.n_t, self.unique_t_shapes = unique_shape(self.t_shapes)
-        self.AFD = AFD(self).cuda()
-        self.aux_optimizer = optim.SGD(self.AFD.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
+        self.IBD = IBD(self).cuda()
+        self.aux_optimizer = optim.SGD(self.IBD.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
+
+        from models import get_ResNet_F
+        proxy_net = get_ResNet_F(depth=18,num_classes=self.num_classes).cuda()
+        proxy_net = proxy_net.cuda()
+        save_point = args.model_dir+args.dataset+os.sep
+        aux_path = save_point + f'cifar10-natural-f-best.t7'
+        # aux_path = save_point + args.aux_name + f'-latest.t7'
+        if os.path.isfile(aux_path):
+            checkpoint = torch.load(aux_path)
+            pretrain_dict = checkpoint['net']
+            # pretrain_dict = checkpoint
+            model_dict = {}
+            state_dict = proxy_net.state_dict()
+            for k, v in pretrain_dict.items():
+                if k in state_dict:
+                    model_dict[k] = v
+            state_dict.update(model_dict)
+            proxy_net.load_state_dict(state_dict)
+            proxy_net.eval()
+        self.proxy_net = proxy_net
 
     def train(self, epoch, inputs, targets, index, optimizer):
         #### generating adversarial examples stage
+        for param_group in self.aux_optimizer.param_groups:
+            if epoch < self.args.decay_epoch1:
+                param_group['lr'] = 0.1
+            elif epoch < self.args.decay_epoch2:
+                param_group['lr'] = 0.01
+            else:
+                param_group['lr'] = 0.001
         self.basic_net.eval()
         self.aux_net.eval()
         batch_size = len(inputs)
         x_adv = inputs.detach() + 0.001 * torch.randn(inputs.shape).cuda().detach()
-        logits_tea = self.aux_net(x_adv)
+        logits_tea, feat_list_tea = self.aux_net(x_adv, True)
+        feat_list_tea = [f.detach() for f in feat_list_tea]
         logits_tea = logits_tea.detach()
         if self.norm == 'l_inf':
             for _ in range(self.num_steps): 
@@ -83,7 +107,7 @@ class Dist_Module(nn.Module):
                     #############
                     loss_adv = self.criterion_kl(F.log_softmax(logits_adv, dim=1),
                                         F.softmax(logits_tea, dim=1))
-   
+               
                 loss_adv = loss_adv 
                 grad = torch.autograd.grad(loss_adv, [x_adv])[0]
                 x_adv = x_adv.detach() + self.step_size * torch.sign(grad.detach())
@@ -91,32 +115,32 @@ class Dist_Module(nn.Module):
                 x_adv = torch.clamp(x_adv, 0.0, 1.0)
         adv_inputs = Variable(torch.clamp(x_adv, 0.0, 1.0), requires_grad=False)
         
+        # logits_tea = self.proxy_net(inputs)
+
         #### adversarial tarining stage
         self.basic_net.train()
         self.basic_net.zero_grad()
+        self.IBD.train()
+        self.IBD.zero_grad()
         optimizer.zero_grad()
+        self.aux_optimizer.zero_grad()
 
-        logits_nat = self.basic_net(inputs)
-        logits_adv = self.basic_net(adv_inputs)
-
+        logits_nat, feat_list_nat = self.basic_net(inputs, True)
         loss_nat = self.criterion(logits_nat, targets)
+        logits_adv, feat_list_adv = self.basic_net(adv_inputs, True)
         loss_adv = self.criterion(logits_adv, targets)
+        loss_ibd = self.IBD(feat_list_adv, feat_list_tea)
 
-        a1 = 0.1
-        a2 = 0.9
-        loss_kl_nat = (1.0/batch_size) * self.criterion_kl(F.log_softmax(logits_nat, dim=1), F.softmax(logits_tea, dim=1))
-        loss_kl_adv = (1.0/batch_size) * self.criterion_kl(F.log_softmax(logits_adv, dim=1), F.softmax(logits_tea, dim=1))
-        loss_cls =  a1*loss_kl_nat + a2*loss_kl_adv
-
-        loss_afd = loss_cls
-        b  = 0.8
-        loss = loss_cls
+        loss_nat = (1.0/batch_size) * self.criterion_kl(F.log_softmax(logits_nat, dim=1), F.softmax(logits_tea, dim=1))
+        loss_adv = (1.0/batch_size) * self.criterion_kl(F.log_softmax(logits_adv, dim=1), F.softmax(logits_tea, dim=1))
         
+        a = b =0.8
+        loss = loss_nat*(1-a) + loss_adv*a + loss_ibd*b
         loss.backward()
         optimizer.step()
         self.aux_optimizer.step()
 
-        return logits_nat.detach(), logits_adv.detach(), loss.item(), loss_cls.item(), loss_afd.item()
+        return logits_nat.detach(), logits_adv.detach(), loss.item(), loss_adv.item(), loss_ibd.item()
 
     def test(self, inputs, targets, adversary=None):
         if adversary is not None:
@@ -127,7 +151,6 @@ class Dist_Module(nn.Module):
         loss = self.criterion(logits, targets)
 
         return logits.detach(), loss.item()
-
 
 class nn_bn_relu(nn.Module):
     def __init__(self, nin, nout):
@@ -141,9 +164,9 @@ class nn_bn_relu(nn.Module):
             return self.relu(self.bn(self.linear(x)))
         return self.bn(self.linear(x))
 
-class AFD(nn.Module):
+class IBD(nn.Module):
     def __init__(self, args):
-        super(AFD, self).__init__()
+        super(IBD, self).__init__()
         self.guide_layers = args.guide_layers
         self.hint_layers = args.hint_layers
         self.attention = Attention(args).cuda()
@@ -237,3 +260,5 @@ class Sample(nn.Module):
     def forward(self, g_s, bs):
         g_s = torch.stack([self.sample(f_s.pow(2).mean(1, keepdim=True)).view(bs, -1) for f_s in g_s], dim=1)
         return g_s
+
+
